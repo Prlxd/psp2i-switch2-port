@@ -2329,7 +2329,7 @@ index 0000000..92ca25e
 +icon_local.jpg
 diff --git a/port/switch2/Makefile b/port/switch2/Makefile
 new file mode 100644
-index 0000000..99bcdc6
+index 0000000..68d1881
 --- /dev/null
 +++ b/port/switch2/Makefile
 @@ -0,0 +1,118 @@
@@ -2348,7 +2348,7 @@ index 0000000..99bcdc6
 +AT3       ?= ../atrac_dll/at3_standalone
 +GEN_OBJ   ?=
 +BUILD_NUM ?= 0
-+VERSION   ?= 0.9.1
++VERSION   ?= 0.9.2
 +
 +TARGET    := psp2i
 +APP_TITLE := Phantasy Star Portable 2 Infinity (Switch 2 Port)
@@ -2453,7 +2453,7 @@ index 0000000..99bcdc6
 +.PHONY: all clean FORCE
 diff --git a/port/switch2/README.md b/port/switch2/README.md
 new file mode 100644
-index 0000000..617f906
+index 0000000..3b1b67a
 --- /dev/null
 +++ b/port/switch2/README.md
 @@ -0,0 +1,57 @@
@@ -2475,11 +2475,11 @@ index 0000000..617f906
 +## SD card layout
 +
 +```
-+sdmc:/switch/psp2i.nro
-+sdmc:/psp2i/<your English-patched ISO>.iso
-+sdmc:/psp2i/GameData/flash/font/      the PSP fonts
-+sdmc:/psp2i/GameData/ms/              saves (made on first save)
-+sdmc:/psp2i/textures/                 optional: PPSSPP-format texture packs
++sdmc:/switch/psp2i/psp2i.nro
++sdmc:/switch/psp2i/<your English-patched ISO>.iso
++sdmc:/switch/psp2i/GameData/flash/font/      the PSP fonts
++sdmc:/switch/psp2i/GameData/ms/              saves (made on first save)
++sdmc:/switch/psp2i/textures/                 optional: PPSSPP-format texture packs
 +```
 +
 +No game files are included; you supply your own copy of the game.
@@ -2488,12 +2488,12 @@ index 0000000..617f906
 +
 +60 fps, FPS counter off, internal resolution 4x, draw distance far, fog off,
 +anisotropic 4x, mipmaps on, custom textures off, scaling nearest. All of them
-+can be changed in the in-game menu (saved to `sdmc:/psp2i/psp2i.ini`).
++can be changed in the in-game menu (saved to `sdmc:/switch/psp2i/psp2i.ini`).
 +
 +## Custom textures
 +
 +PPSSPP-format texture packs (a folder with a `textures.ini` and its PNGs) go in
-+`sdmc:/psp2i/textures/`. Turn CUSTOM TEXTURES on in the menu. The whole pack is
++`sdmc:/switch/psp2i/textures/`. Turn CUSTOM TEXTURES on in the menu. The whole pack is
 +loaded behind a loading bar at start-up, so nothing loads during play. The first
 +start after adding or changing a pack also writes `textures/cache.bin`; later
 +starts read that instead and load in a second or two. If you replace a PNG
@@ -3292,10 +3292,10 @@ index 0000000..3b4cdb8
 +    main(sys.argv[1], sys.argv[2])
 diff --git a/port/switch2/switch_main.c b/port/switch2/switch_main.c
 new file mode 100644
-index 0000000..f4e861a
+index 0000000..acc3a1d
 --- /dev/null
 +++ b/port/switch2/switch_main.c
-@@ -0,0 +1,1632 @@
+@@ -0,0 +1,1640 @@
 +/* PSP2i on Switch 2 under kaiHEN: the libnx host (an NRO).
 + *
 + * Modelled on the SDL3 host (host/sdl_main.c), with SDL replaced by libnx and
@@ -3316,7 +3316,7 @@ index 0000000..f4e861a
 + *     are START and SELECT, the right stick turns the camera, R3 opens the
 + *     settings menu, + and - together quit to the homebrew menu.
 + *
-+ * Files, in sdmc:/psp2i/:
++ * Files, in sdmc:/switch/psp2i/ (beside the NRO):
 + *
 + *   *.iso              the game (psp2i.ini iso=<path> to choose another)
 + *   EBOOT.BIN          optional: a decrypted EBOOT when the disc's is encrypted
@@ -3367,10 +3367,10 @@ index 0000000..f4e861a
 +#define PSP2I_SWITCH_BUILD 0
 +#endif
 +#ifndef PSP2I_SWITCH_VERSION
-+#define PSP2I_SWITCH_VERSION "0.9.1"
++#define PSP2I_SWITCH_VERSION "0.9.2"
 +#endif
 +
-+#define BASE "sdmc:/psp2i"
++#define BASE "sdmc:/switch/psp2i"     /* the NRO, the ISO, GameData, textures, logs: all in one folder */
 +#define SCREEN_W 480
 +#define SCREEN_H 272
 +#define USER_PARTITION_TOP 0x0A000000u
@@ -4572,7 +4572,7 @@ index 0000000..f4e861a
 +
 +static int path_exists(const char *p) { struct stat st; return stat(p, &st) == 0; }
 +
-+/* The first .iso in sdmc:/psp2i/ when psp2i.ini names none. */
++/* The first .iso in sdmc:/switch/psp2i/ when psp2i.ini names none. */
 +static int find_iso(char *out, size_t cap) {
 +    DIR *d = opendir(BASE);
 +    if (!d) return 0;
@@ -4654,8 +4654,16 @@ index 0000000..f4e861a
 +    snprintf(p, sizeof p, "%s/disc/PSP_GAME", root);
 +    const int extracted = path_exists(p);
 +    if (!extracted) {
++        if (g_iso_path[0] && !path_exists(g_iso_path)) {   /* psp2i.ini's iso= gone (moved from the old sdmc:/psp2i/): look again */
++            fprintf(stderr, "iso: %s not found; looking in " BASE "\n", g_iso_path);
++            g_iso_path[0] = '\0';
++        }
 +        if (!g_iso_path[0]) find_iso(g_iso_path, sizeof g_iso_path);
-+        if (!g_iso_path[0]) { fail("No game found. Put your English-patched Phantasy Star Portable 2 Infinity .iso in sdmc:/psp2i/ (see psp2i.wiki/w/Installation#English_patch)"); return NULL; }
++        if (!g_iso_path[0] && path_exists("sdmc:/psp2i")) {
++            fail("The port's folder has moved: move the contents of sdmc:/psp2i/ (the ISO, GameData, textures, psp2i.ini) into sdmc:/switch/psp2i/, beside psp2i.nro");
++            return NULL;
++        }
++        if (!g_iso_path[0]) { fail("No game found. Put your English-patched Phantasy Star Portable 2 Infinity .iso in sdmc:/switch/psp2i/ (see psp2i.wiki/w/Installation#English_patch)"); return NULL; }
 +        fprintf(stderr, "iso: %s\n", g_iso_path);
 +        if (psp_io_open_disc_image(g_iso_path) != 0) {
 +            snprintf(msg, sizeof msg, "%s is not a PSP disc image the port can read.", g_iso_path);
