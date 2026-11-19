@@ -11,7 +11,7 @@ Based on [PSP2I_Recomp](https://github.com/zmbkilla/PSP2I_Recomp), a static reco
 
 - **60 fps** throughout, from the game's own 30 fps. **120 fps is experimental.**
 - Dodge rolls fixed at 60 fps (no jump forward at the start of a roll).
-- Up to **4x internal resolution** (1920x1088), with crisp or smooth scaling and optional FXAA.
+- Up to **4x internal resolution** (drawn at 1920x1088 and fitted to the 1080p screen), with crisp or smooth scaling and optional FXAA.
 - Anisotropic filtering, mipmaps (no shimmering textures in the distance) and a longer draw distance.
 - **Custom texture packs** (PPSSPP format), loaded at start-up so they never pop in or stutter.
 - The ISO is loaded into memory at start-up, so loading never waits on the SD card.
@@ -77,7 +77,7 @@ Open the menu with **R3**. Changes are saved to `sdmc:/psp2i/psp2i.ini` as you m
 |---|---|---|
 | Frame rate | 60 FPS | `60` runs the game at 60 fps. `30` is the PSP's own rate. `120` is **experimental**. |
 | FPS counter | Off | Shows the frame rate in the corner. |
-| Internal resolution | 4x | `4x` is 1920x1088 and holds 60 fps. `1x` to `3x` also work. |
+| Internal resolution | 4x | `4x` is drawn at 1920x1088 and fitted to the 1080p screen, and holds 60 fps. `1x` to `3x` also work. |
 | Draw distance | Far | Draws distant scenery further away than on the PSP. `Normal` is the PSP's own distance; `Max` brings in every object and can drop below 60 fps. |
 | Fog | Off | The game's distance fog. |
 | Anisotropic | 4x | Sharper textures on floors and walls seen at an angle. |
