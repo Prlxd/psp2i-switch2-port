@@ -1,0 +1,1358 @@
+diff --git a/include/psprecomp/hle.h b/include/psprecomp/hle.h
+index a776c24..b3a5793 100644
+--- a/include/psprecomp/hle.h
++++ b/include/psprecomp/hle.h
+@@ -40,6 +40,19 @@ int psp_hle_is_named(int index);
+ /* Call a firmware function by NID. An unregistered NID reports itself by name
+  * where possible and by number otherwise, rather than failing silently. */
+ void psp_hle_call(uint32_t nid);
++/* The `top` firmware calls by host time since the last call: "name ms, ...". */
++void psp_hle_time_top(char *out, size_t cap, int top);
++
++/* Profiling marker (hle.c): the guest block last entered, or 1 idle, 2 firmware, 3 GE wait. */
++extern volatile uint32_t psp_prof_cur;
++
++/* The last PSP_HLE_TRAIL firmware calls, newest at (psp_hle_trail_n - 1). */
++#define PSP_HLE_TRAIL 64
++typedef struct { uint32_t nid, ra; const char *name; } psp_hle_crumb;
++extern volatile psp_hle_crumb psp_hle_trail[PSP_HLE_TRAIL];
++extern volatile uint32_t psp_hle_trail_n;
++/* The running PSP thread's name ("" between threads), for a hang report. */
++const char *psp_thread_current_name(void);
+ 
+ /* Look up what is registered, for reporting. Returns NULL if absent. */
+ const char *psp_hle_name(uint32_t nid);
+@@ -151,8 +164,11 @@ uint64_t psp_ge_pixels(void);
+  * on the hardware, beside the game. init runs first on that thread. */
+ int  psp_ge_thread_start(void (*init)(void));
+ int  psp_ge_threaded(void);
++/* Ends the GE thread (fini runs last on it); lists run on the caller again. */
++void psp_ge_thread_stop(void (*fini)(void));
+ int  psp_ge_on_thread(void);          /* the caller is the GE thread */
+ void psp_ge_wait_idle(void);          /* until it has done everything handed to it */
++void psp_ge_job_done_with_memory(void); /* a GE-thread job: done with PSP memory, idle waiters may go */
+ /* fn(arg) on the GE thread after what is queued (wait: until it ran); here
+  * and now without the thread. */
+ void psp_ge_call(void (*fn)(void *), void *arg, int wait);
+@@ -306,6 +322,13 @@ int      psp_sched_run(uint32_t entry, uint32_t arglen, uint32_t argp,
+                        uint32_t prio, uint32_t stack_size, uint32_t gp);
+ int      psp_sched_active(void);
+ uint64_t psp_sched_now_us(void);
++void psp_sched_yield_now(void);
++void psp_sched_gap_stats(uint64_t *max_us, const char **thread, const char **after_call);
++void psp_preempt_set_enabled(int on);
++void psp_sched_thread_top(char *out, size_t cap, int top);
++void psp_hle_time_top_nonblocking(char *out, size_t cap, int top);
++void psp_sched_set_vblank_60(int on);   /* vblank at 60.000 Hz instead of 59.94 */
++void psp_io_read_stats(uint64_t *max_us, uint32_t *bytes);   /* preemption inside game code (default on) */
+ uint64_t psp_sched_idle_us(void);    /* host time with nothing runnable */
+ uint64_t psp_display_flips(void);    /* sceDisplaySetFrameBuf calls */
+ /* Called on every sceDisplayWaitVblank* (kind 0) and sceDisplayGetVcount
+diff --git a/include/psprecomp/mem.h b/include/psprecomp/mem.h
+index dcd65b5..89d697f 100644
+--- a/include/psprecomp/mem.h
++++ b/include/psprecomp/mem.h
+@@ -101,6 +101,8 @@ void psp_mem_set_read_watch_hook(void (*fn)(uint32_t watched, uint32_t addr));
+ uint8_t  psp_read8 (uint32_t addr);
+ uint16_t psp_read16(uint32_t addr);
+ uint32_t psp_read32(uint32_t addr);
++/* Main RAM while plain accesses need no checks (else NULL): see mem.c. */
++extern uint8_t *psp_fast_rd, *psp_fast_wr;
+ float    psp_read_f32(uint32_t addr);
+ 
+ void psp_write8 (uint32_t addr, uint8_t  val);
+diff --git a/include/psprecomp/recomp_rt.h b/include/psprecomp/recomp_rt.h
+index ea82360..fde7e7c 100644
+--- a/include/psprecomp/recomp_rt.h
++++ b/include/psprecomp/recomp_rt.h
+@@ -251,9 +251,16 @@ static inline uint32_t psp_f2w(float v, uint32_t mode) {
+  * hot path in any recompiled game; correctness first. */
+ static inline float psp_fsqrt(float v) {
+     if (v <= 0.0f) return 0.0f;
++#if defined(__GNUC__) && (defined(__aarch64__) || defined(__x86_64__))
++    /* The FPU's square root: correctly rounded (IEEE), one instruction. The
++     * loop below costs 24 divisions; it sits under VFPU vsqrt/vrsq, which
++     * PSP2i's engine calls per vector (normalise, length) -- a hot path. */
++    return __builtin_sqrtf(v);
++#else
+     float g = v;
+     for (int i = 0; i < 24; i++) g = 0.5f * (g + v / g);
+     return g;
++#endif
+ }
+ 
+ /* `c.<cond>.s` condition codes. The distinction that matters is *ordered* vs
+diff --git a/include/psprecomp/render.h b/include/psprecomp/render.h
+index b416c5c..01f59d1 100644
+--- a/include/psprecomp/render.h
++++ b/include/psprecomp/render.h
+@@ -11,7 +11,9 @@
+ #ifndef PSPRECOMP_RENDER_H
+ #define PSPRECOMP_RENDER_H
+ 
++#include <stddef.h>
+ #include <stdint.h>
++#include <stdio.h>
+ 
+ /* A vertex after format decoding: screen space, colour resolved.
+  * Texture coordinates extend this rather than replacing it. */
+@@ -82,6 +84,7 @@ typedef struct {
+     float rhw;             /* 1/w (1 in through mode) */
+     float u, v;            /* texel coordinates */
+     float r, g, b, a;      /* 0..255 */
++    float fog;             /* fog factor: 1 = none, 0 = all fog colour (used when the state's fog is on) */
+ } psp_gpu_vertex;
+ 
+ typedef struct {
+@@ -102,6 +105,10 @@ typedef struct {
+     int      ztest; int zfunc; int zwrite;
+     int      blend; int bsrc, bdst, beq; uint32_t fixa, fixb;
+     uint32_t mask_rgb, mask_a;        /* write masks: set bits are preserved */
++    int      fog;                     /* fog on (transformed geometry only) */
++    uint32_t fog_col;                 /* 0xBBGGRR */
++    float    fog_end, fog_slope;      /* factor = clamp((view z + end) * slope, 0, 1) */
++    int      through;                 /* through mode: 2D, screen coordinates (HUD, menus, copies) */
+ } psp_gpu_state;
+ 
+ /* A transformed triangle draw with the vertex work left to the GPU (draw_tl):
+@@ -193,11 +200,18 @@ void psp_gpu_cpu_sync(void);
+ /* Diagnostics: describe every draw of the next whole frame (target, vertex
+  * format, state, first vertices) into the text file `path`. */
+ void psp_gpu_dump_next_frame(const char *path);
++void  psp_gpu_track_dump(FILE *out);         /* the last frames' character positions (diagnostics) */
++char *psp_gpu_dump_take(size_t *len);        /* the finished dump (free it), or NULL */
+ 
+ /* For backends: decode the current texture (level 0, as the draw state
+  * describes it) into tex_w*tex_h RGBA8 pixels, 0xAABBGGRR. */
+ void psp_gpu_decode_texture(uint32_t *out);
+ /* For backends: a hash of the current texture's bytes (and CLUT). */
+ uint64_t psp_gpu_texture_hash(void);
++/* PPSSPP texture-pack key of the current texture (textures.ini: %08x of key_lo,
++ * %08x of hash); xxh64_hash picks the pack's hash = xxh64 (else xxh32). 0: no key. */
++int psp_gpu_pack_key(uint32_t *key_lo, uint32_t *hash, int xxh64_hash);
++uint32_t psp_gpu_xxh32(const void *p, size_t n, uint32_t seed);
++uint64_t psp_gpu_xxh64(const void *p, size_t n, uint64_t seed);
+ 
+ #endif
+\ No newline at end of file
+diff --git a/src/hle/ge.c b/src/hle/ge.c
+index 3236fc8..94589e7 100644
+--- a/src/hle/ge.c
++++ b/src/hle/ge.c
+@@ -175,8 +175,16 @@ static int on_worker(void) { return GetCurrentThreadId() == g_worker_id; }
+ #    define WAKE(c)       pthread_cond_broadcast(&(c))
+ static pthread_mutex_t g_lk = PTHREAD_MUTEX_INITIALIZER;
+ static pthread_cond_t  g_work_cv = PTHREAD_COND_INITIALIZER, g_idle_cv = PTHREAD_COND_INITIALIZER;
++#  ifdef __SWITCH__
++/* Switch (libnx): the thread is made with threadCreate, so it gets a CPU core
++ * of its own (pthreads there start on the creating thread's core). */
++#    include <switch.h>
++static Thread          g_worker;
++static int on_worker(void) { return threadGetCurHandle() == g_worker.handle; }
++#  else
+ static pthread_t       g_worker;
+ static int on_worker(void) { return pthread_equal(pthread_self(), g_worker); }
++#  endif
+ #endif
+ 
+ /* Jobs, in order: run the lists (RUN), or host work (psp_ge_call). */
+@@ -241,14 +249,29 @@ void psp_ge_wait_idle(void) {
+     if (!g_threaded || on_worker()) return;
+     LOCK();
+     if (g_job_head != g_job_tail || g_worker_busy) {
++        const uint32_t pc_ = psp_prof_cur;
++        psp_prof_cur = 3;
+         const uint64_t t0 = psp_sched_now_us();
+         while (g_job_head != g_job_tail || g_worker_busy) WAIT(g_idle_cv);
+         g_waits++;
+         g_wait_us += psp_sched_now_us() - t0;
++        psp_prof_cur = pc_;
+     }
+     UNLOCK();
+ }
+ 
++/* Called by a job on the GE thread that is done with the PSP's memory but
++ * still has host work left (a present waiting in eglSwapBuffers for the
++ * display): with nothing else queued, waiters for an idle GE may go on now.
++ * The game's VRAM writes (a movie frame each vblank) then no longer wait for
++ * the display's refresh. */
++void psp_ge_job_done_with_memory(void) {
++    if (!g_threaded || !on_worker()) return;
++    LOCK();
++    if (g_job_head == g_job_tail) { g_worker_busy = 0; WAKE(g_idle_cv); }
++    UNLOCK();
++}
++
+ /* Host work on the GE thread, after what is queued: wait = 1 returns once it
+  * ran. Without the thread (or on it) it runs here and now. */
+ typedef struct { void (*fn)(void *); void *arg; volatile int done; } ge_sync;
+@@ -442,7 +465,7 @@ static void run_queues(void) {
+     }
+ }
+ 
+-static volatile int g_worker_ready;
++static volatile int g_worker_ready, g_worker_exit;
+ static void worker_loop(void) {
+     if (g_worker_init) g_worker_init();
+     LOCK();
+@@ -458,10 +481,13 @@ static void worker_loop(void) {
+         if (j.fn) j.fn(j.arg); else run_queues();
+         if (j.fn) g_job_us += psp_sched_now_us() - t0;
+         LOCK();
++        if (g_worker_exit) { g_worker_busy = 0; WAKE(g_idle_cv); UNLOCK(); return; }
+     }
+ }
+ #ifdef _WIN32
+ static DWORD WINAPI worker_main(LPVOID p) { (void)p; worker_loop(); return 0; }
++#elif defined(__SWITCH__)
++static void worker_main(void *p) { (void)p; worker_loop(); }
+ #else
+ static void *worker_main(void *p) { (void)p; worker_loop(); return NULL; }
+ #endif
+@@ -477,6 +503,22 @@ int psp_ge_thread_start(void (*init)(void)) {
+     if (!h) return -1;
+     SetThreadPriority(h, THREAD_PRIORITY_ABOVE_NORMAL);
+     CloseHandle(h);
++#elif defined(__SWITCH__)
++    {   /* the highest core the process may use other than this thread's; the default core if refused */
++        u64 mask = 0;
++        svcGetInfo(&mask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0);
++        const int here = (int)svcGetCurrentProcessorNumber();
++        int core = -2;
++        for (int c = 3; c >= 0 && core == -2; c--) if (((mask >> c) & 1) && c != here) core = c;
++        s32 prio = 0x2C;
++        svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
++        Result rc = threadCreate(&g_worker, worker_main, NULL, NULL, 8u << 20, prio, core);
++        if (R_FAILED(rc) && core != -2) { core = -2; rc = threadCreate(&g_worker, worker_main, NULL, NULL, 8u << 20, prio, -2); }
++        if (R_FAILED(rc)) return -1;
++        if (R_FAILED(threadStart(&g_worker))) { threadClose(&g_worker); return -1; }
++        fprintf(stderr, "psprecomp: GE thread on core %d (game thread on core %d, process cores 0x%llx)\n", core, here,
++                (unsigned long long)mask);
++    }
+ #else
+     if (pthread_create(&g_worker, NULL, worker_main, NULL) != 0) return -1;
+ #endif
+@@ -615,3 +657,27 @@ void psp_ge_register(void) {
+     psp_hle_register(0xE47E40E4, "sceGe_user", "sceGeEdramGetAddr",        hle_EdramGetAddr);
+     psp_hle_register(0x1F6752AD, "sceGe_user", "sceGeEdramGetSize",        hle_EdramGetSize);
+ }
++
++/* Ends the GE thread after what it was handed: `fini` runs last on it (the
++ * host's renderer releases its context there); lists run on the calling
++ * thread again afterwards. */
++static void (*g_worker_fini)(void);
++static void exit_job(void *p) { (void)p; if (g_worker_fini) g_worker_fini(); g_worker_exit = 1; }
++void psp_ge_thread_stop(void (*fini)(void)) {
++    if (!g_threaded) return;
++    g_worker_fini = fini;
++    LOCK();
++    push_job(exit_job, NULL);
++    UNLOCK();
++#if defined(__SWITCH__)
++    threadWaitForExit(&g_worker);
++    threadClose(&g_worker);
++#elif !defined(_WIN32)
++    pthread_join(g_worker, NULL);
++#else
++    LOCK();
++    while (!g_worker_exit || g_worker_busy) WAIT(g_idle_cv);
++    UNLOCK();
++#endif
++    g_threaded = 0;
++}
+diff --git a/src/hle/gpu.c b/src/hle/gpu.c
+index 454c7d5..e56c535 100644
+--- a/src/hle/gpu.c
++++ b/src/hle/gpu.c
+@@ -61,6 +61,7 @@ static float    g_bone[8 * 12];
+ static uint32_t g_world_i, g_view_i, g_proj_i, g_tgen_i, g_bone_i;
+ static uint8_t  g_clut[1024];            /* the CLUT cache, filled by CLOAD */
+ static uint64_t g_clut_hash;             /* FNV-1a of g_clut, updated by CLOAD */
++static uint32_t g_clut_total, g_clut_max; /* bytes the last CLOAD copied, and the most any did (texture-pack keys) */
+ static uint64_t g_pixels;
+ /* Profiling counters (rasterizer workload). */
+ static uint64_t c_tested, c_shaded, c_textured, c_linear, c_sprite_px, c_tri_px, c_blend, c_clear;
+@@ -348,6 +349,7 @@ typedef struct {
+     float w;               /* 1/w for perspective correction (1 in through mode) */
+     float u, v;            /* texel space, already divided where needed */
+     float r, g, b, a;      /* 0..255 */
++    float fog;             /* fog factor, 1 = none */
+ } vtx;
+ 
+ static int g_clear, g_tex, g_through;
+@@ -355,8 +357,12 @@ static uint32_t g_fb, g_fbw, g_zb, g_zbw;
+ static int g_psm;
+ static int g_sx0, g_sy0, g_sx1, g_sy1;
+ 
++static int g_track_new = 1;             /* a clear was drawn: the next skinned draw starts a frame (track_note) */
++static void track_any(void);
+ static void setup_draw(void) {
+     g_clear = (int)(R[0xD3] & 1);
++    if (g_clear) g_track_new = 1;
++    else if (!((R[0x12] >> 23) & 1)) track_any();
+     g_tex = !g_clear && (R[0x1E] & 1);
+     g_fb = fb_addr(); g_fbw = fb_w();
+     g_zb = zb_addr(); g_zbw = zb_w();
+@@ -637,11 +643,17 @@ static uint32_t tex_extent(uint32_t w, uint32_t h, uint32_t bufw, int bpp, int s
+     return m + 4;
+ }
+ 
+-static void fast_setup(void) {
++/* tex_only: the texture state alone (psp_gpu_decode_texture). Mapping the
++ * colour buffer reaches a coherent backend's VRAM hook, and that reads the
++ * target being drawn back from the GPU -- a full pipeline stall -- although
++ * a texture decode never touches it. On the Switch port that was one 4x
++ * readback per decoded texture: most of the frame-time spikes in fights. */
++static void fast_setup_mode(int tex_only) {
+     F.ok = F.tex_ok = 0; F.fb = F.zb = NULL; F.tbase = NULL;
+     if (g_ref || !g_fbw) return;
+     F.bpp = g_psm == 3 ? 4 : 2;
+     F.fbw = g_fbw;
++    if (tex_only) goto texture;
+     /* Every pixel the scissor admits must be addressable. */
+     uint32_t fb_bytes = ((uint32_t)g_sy1 * g_fbw + (uint32_t)g_sx1 + 1) * (uint32_t)F.bpp;
+     F.fb = mem(g_fb, fb_bytes);
+@@ -652,6 +664,7 @@ static void fast_setup(void) {
+         if (!F.zb) return;
+         F.zbw = g_zbw;
+     }
++texture:
+     if (g_tex) {
+         static const int bpp_of[11] = { 16, 16, 16, 32, 4, 8, 16, 32, 0, 0, 0 };
+         F.tpsm = (int)(R[0xC3] & 0xF);
+@@ -680,6 +693,7 @@ static void fast_setup(void) {
+     }
+     F.ok = 1;
+ }
++static void fast_setup(void) { fast_setup_mode(0); }
+ 
+ static inline uint16_t ld16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
+ static inline uint32_t ld32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
+@@ -956,6 +970,78 @@ static void raster_tri(const vtx *a, const vtx *b, const vtx *c) {
+ 
+ /* ---- vertices ------------------------------------------------------------------ */
+ 
++/* ---- diagnostics: where the skinned models are, frame by frame ---------------
++ * For each displayed frame, the distinct translations of the first bone of
++ * its skinned (character) draws -- PSP2i leaves the world and view matrices
++ * the identity and puts each body part's place relative to the camera in its
++ * bones. A ring of
++ * the last TRACK_FRAMES frames, written out on request (psp_gpu_track_dump):
++ * a jump in the player's row is the camera or the player jumping. */
++#define TRACK_FRAMES 360
++#define TRACK_PER    16
++static struct { uint64_t flip, vb; int n, cam_set; float p[TRACK_PER][3]; float cam[12]; } g_track[TRACK_FRAMES];
++static unsigned g_track_i;
++static void track_note(void) {
++    if (g_track_new) {
++        g_track_new = 0;
++        g_track_i = (g_track_i + 1) % TRACK_FRAMES;
++        g_track[g_track_i].flip = psp_display_flips();
++        g_track[g_track_i].n = 0;
++        g_track[g_track_i].cam_set = 0;
++    }
++    int *n = &g_track[g_track_i].n;
++    for (int k = 0; k < *n; k++)
++        if (g_track[g_track_i].p[k][0] == g_world[9] + g_bone[9] && g_track[g_track_i].p[k][1] == g_world[10] + g_bone[10] && g_track[g_track_i].p[k][2] == g_world[11] + g_bone[11]) return;
++    if (*n >= TRACK_PER) return;
++    g_track[g_track_i].p[*n][0] = g_world[9] + g_bone[9]; g_track[g_track_i].p[*n][1] = g_world[10] + g_bone[10]; g_track[g_track_i].p[*n][2] = g_world[11] + g_bone[11];
++    if (!g_track[g_track_i].cam_set) { for (int k = 0; k < 12; k++) g_track[g_track_i].cam[k] = g_view[k]; g_track[g_track_i].cam_set = 1; }
++    (*n)++;
++}
++/* The first scenery draw of a frame with a world matrix that is not the
++ * identity: PSP2i bakes the camera into it, so it moving is the camera moving. */
++static void track_cam(void) {
++    if (g_world[9] == 0.0f && g_world[10] == 0.0f && g_world[11] == 0.0f) return;
++    if (g_track_new) {
++        g_track_new = 0;
++        g_track_i = (g_track_i + 1) % TRACK_FRAMES;
++        g_track[g_track_i].flip = psp_display_flips();
++        g_track[g_track_i].n = 0;
++        g_track[g_track_i].cam_set = 0;
++    }
++    if (g_track[g_track_i].cam_set) return;
++    for (int k = 0; k < 12; k++) g_track[g_track_i].cam[k] = g_view[k];
++    g_track[g_track_i].cam_set = 1;
++}
++/* Every 3D draw: the view matrix (once a frame) and each distinct world translation. */
++static void track_any(void) {
++    if (g_track[g_track_i].flip != psp_display_flips()) {
++        g_track_new = 0;
++        g_track_i = (g_track_i + 1) % TRACK_FRAMES;
++        g_track[g_track_i].flip = psp_display_flips();
++        g_track[g_track_i].vb = psp_sched_vblank_count();
++        g_track[g_track_i].n = 0;
++        g_track[g_track_i].cam_set = 0;
++    }
++    if (!g_track[g_track_i].cam_set) { for (int k = 0; k < 12; k++) g_track[g_track_i].cam[k] = g_view[k]; g_track[g_track_i].cam_set = 1; }
++    int *n = &g_track[g_track_i].n;
++    for (int k = 0; k < *n; k++)
++        if (g_track[g_track_i].p[k][0] == g_world[9] && g_track[g_track_i].p[k][1] == g_world[10] && g_track[g_track_i].p[k][2] == g_world[11]) return;
++    if (*n >= TRACK_PER) return;
++    if (*n == 1) for (int k = 0; k < 12; k++) g_track[g_track_i].cam[k] = g_world[k];   /* a scenery draw's full matrix: the camera's rotation */
++    g_track[g_track_i].p[*n][0] = g_world[9]; g_track[g_track_i].p[*n][1] = g_world[10]; g_track[g_track_i].p[*n][2] = g_world[11];
++    (*n)++;
++}
++void psp_gpu_track_dump(FILE *out) {
++    for (unsigned k = 1; k <= TRACK_FRAMES; k++) {
++        const unsigned i = (g_track_i + k) % TRACK_FRAMES;
++        if (!g_track[i].n && !g_track[i].cam_set) continue;
++        fprintf(out, "%llu v%llu", (unsigned long long)g_track[i].flip, (unsigned long long)g_track[i].vb);
++        if (g_track[i].cam_set) { fprintf(out, " cam"); for (int k = 0; k < 12; k++) fprintf(out, " %.5f", g_track[i].cam[k]); }
++        for (int j = 0; j < g_track[i].n; j++) fprintf(out, " | %.2f %.2f %.2f", g_track[i].p[j][0], g_track[i].p[j][1], g_track[i].p[j][2]);
++        fputc('\n', out);
++    }
++}
++
+ #define VT_TEX(v)     ((v) & 3)
+ #define VT_COLOR(v)   (((v) >> 2) & 7)
+ #define VT_NORMAL(v)  (((v) >> 5) & 3)
+@@ -1107,7 +1193,7 @@ static void tex_coords(const raw_vertex *rv, vtx *o) {
+  * tex_coords). Mode 1 runs a source vector -- the model-space position, the
+  * texture coordinates, or the (normalised) normal, by the projection mode --
+  * through the texture matrix and divides by the third component; mode 2 is
+- * shade mapping from two lights. Both take the UV scale but not the offset. */
++ * shade mapping from two lights. Mode 2 takes the UV scale (not the offset); mode 1 takes neither. */
+ static void tex_gen(int mode, const raw_vertex *rv, const float wn[3], vtx *o) {
+     float su = ge_float(R[0x48]), sv = ge_float(R[0x49]);
+     if (su == 0 && sv == 0) { su = sv = 1.0f; }
+@@ -1134,6 +1220,10 @@ static void tex_gen(int mode, const raw_vertex *rv, const float wn[3], vtx *o) {
+         uv[0] = t[0] / q;
+         uv[1] = t[1] / q;
+     }
++    /* Mode 1 is the texture matrix's result as it stands: the UV scale is
++     * for coordinates from the vertices (a planet's glow layer, whose matrix
++     * already maps to 0..1, came out tiled 2-4 times with it). */
++    if (mode == 1) su = sv = 1.0f;
+     o->u = uv[0] * su * (float)tex_w(0);
+     o->v = uv[1] * sv * (float)tex_h(0);
+ }
+@@ -1150,6 +1240,7 @@ static void lerp_clip(const pvtx *a, const pvtx *b, float t, pvtx *o) {
+     o->s.u = a->s.u + (b->s.u - a->s.u) * t; o->s.v = a->s.v + (b->s.v - a->s.v) * t;
+     o->s.r = a->s.r + (b->s.r - a->s.r) * t; o->s.g = a->s.g + (b->s.g - a->s.g) * t;
+     o->s.b = a->s.b + (b->s.b - a->s.b) * t; o->s.a = a->s.a + (b->s.a - a->s.a) * t;
++    o->s.fog = a->s.fog + (b->s.fog - a->s.fog) * t;
+     to_screen(o->clip, &o->s);
+ }
+ 
+@@ -1176,6 +1267,7 @@ static void hw_push(const vtx *s, const vtx *col) {
+     o->x = s->x; o->y = s->y; o->z = s->z; o->rhw = s->w;
+     o->u = s->u; o->v = s->v;
+     o->r = col->r; o->g = col->g; o->b = col->b; o->a = col->a;
++    o->fog = s->fog;
+ }
+ 
+ /* One triangle, to the software rasterizer or the hardware list. Flat shading
+@@ -1276,13 +1368,27 @@ static FILE *g_dump_file;
+ 
+ /* Describe every draw of the next whole frame into `path` (F12 in the host
+  * window). Same format as PSP2I_GE_DUMP_FLIP, which goes to stderr. */
++/* The dump is written into memory (the draws run on the GE thread, and on
++ * some hosts only the main thread may touch files); psp_gpu_dump_take hands
++ * the finished text to the caller to save. */
++static char *g_dump_mem;
++static size_t g_dump_len;
++static volatile int g_dump_done;
+ void psp_gpu_dump_next_frame(const char *path) {
+-    if (g_dump_req) return;                      /* one at a time */
+-    g_dump_file = fopen(path, "w");
+-    if (!g_dump_file) { fprintf(stderr, "ge-dump: cannot write %s\n", path); return; }
++    (void)path;
++    if (g_dump_req || g_dump_done) return;       /* one at a time */
++    g_dump_mem = NULL; g_dump_len = 0;
++    g_dump_file = open_memstream(&g_dump_mem, &g_dump_len);
++    if (!g_dump_file) { fprintf(stderr, "ge-dump: no memory for a dump\n"); return; }
+     g_dump_req = 1;
+     g_dump_flip = -1;
+-    fprintf(stderr, "ge-dump: next frame -> %s\n", path);
++    fprintf(stderr, "ge-dump: dumping the next frame\n");
++}
++char *psp_gpu_dump_take(size_t *len) {
++    if (!g_dump_done) return NULL;
++    char *m = g_dump_mem; *len = g_dump_len;
++    g_dump_mem = NULL; g_dump_len = 0; g_dump_done = 0;
++    return m;
+ }
+ 
+ /* PSP2I_GE_DUMP_FLIP=N: describe every draw of frame N (counted in display
+@@ -1300,8 +1406,8 @@ static void dump_draw(uint32_t type, uint32_t n, const pvtx *buf) {
+     if (g_dump_req) {
+         if (g_dump_flip < 0) g_dump_flip = (long)psp_display_flips() + 1;
+         if (psp_display_flips() > (uint64_t)g_dump_flip) {
+-            if (g_dump_file) { fclose(g_dump_file); g_dump_file = NULL; }
+-            fprintf(stderr, "ge-dump: frame %ld written\n", g_dump_flip);
++            if (g_dump_file) { fclose(g_dump_file); g_dump_file = NULL; g_dump_done = 1; }
++            fprintf(stderr, "ge-dump: frame %ld captured\n", g_dump_flip);
+             g_dump_req = 0; g_dump_flip = -1;
+         }
+     }
+@@ -1326,9 +1432,23 @@ static void dump_draw(uint32_t type, uint32_t n, const pvtx *buf) {
+             R[0xC9], R[0xCA] & 0xFFFFFF, R[0xDF], R[0xE0] & 0xFFFFFF, R[0xE1] & 0xFFFFFF, R[0xDB],
+             R[0x27] & 1, R[0xE8] & 0xFFFFFF, R[0xE9] & 0xFF, R[0xE7] & 1, R[0x55] & 0xFFFFFF, R[0x58] & 0xFF,
+             R[0x50] & 1, R[0xC5], R[0xC6], R[0xC7]);
++    /* What the renderers leave out or treat specially: stencil (test 0xDC,
++     * ops 0xDD), colour test (0xD8-0xDA), logic op (0xE6), fog, texture
++     * mapping mode and projection (0xC0), dithering, alpha/stencil writes. */
++    fprintf(out, "    more stencil %u test 0x%06X op 0x%06X ctest-func 0x%06X ref 0x%06X mask 0x%06X logic %u op 0x%06X "
++                 "fog %u texmap 0x%06X tmapsrc 0x%06X dither %u tfunc-full 0x%06X texfmt 0x%06X clutfmt 0x%06X\n",
++            R[0x24] & 1, R[0xDC], R[0xDD], R[0xD8], R[0xD9] & 0xFFFFFF, R[0xDA] & 0xFFFFFF, R[0x28] & 1, R[0xE6],
++            R[0x1F] & 1, R[0xC0], R[0xC1], R[0x26] & 1, R[0xC9], R[0xC3], R[0xC5]);
++    fprintf(out, "    uvscale %.4f %.4f offset %.4f %.4f zfunc %u fogcol 0x%06X fog1 %.4f fog2 %.4f\n",
++            ge_float(R[0x48]), ge_float(R[0x49]), ge_float(R[0x4A]), ge_float(R[0x4B]), R[0xDE] & 7, R[0xCF] & 0xFFFFFF,
++            ge_float(R[0xCD]), ge_float(R[0xCE]));
++    if ((R[0xC0] & 3) == 1)
++        fprintf(out, "    tgen %.4f %.4f %.4f | %.4f %.4f %.4f | %.4f %.4f %.4f | t %.4f %.4f %.4f\n",
++                g_tgen[0], g_tgen[1], g_tgen[2], g_tgen[3], g_tgen[4], g_tgen[5], g_tgen[6], g_tgen[7], g_tgen[8],
++                g_tgen[9], g_tgen[10], g_tgen[11]);
+     for (uint32_t i = 0; i < n && i < 3; i++) {
+         const pvtx *p = &buf[i];
+-        fprintf(out, "    v%u screen (%.1f, %.1f, z %.0f) uv (%.2f, %.2f) rgba (%.0f %.0f %.0f %.0f) clip (%.2f %.2f %.2f w %.3f)\n",
++        fprintf(out, "    v%u screen (%.1f, %.1f, z %.2f) uv (%.2f, %.2f) rgba (%.0f %.0f %.0f %.0f) clip (%.2f %.2f %.2f w %.3f)\n",
+                 i, p->s.x, p->s.y, p->s.z, p->s.u, p->s.v, p->s.r, p->s.g, p->s.b, p->s.a,
+                 p->clip[0], p->clip[1], p->clip[2], p->clip[3]);
+     }
+@@ -1372,6 +1492,7 @@ static int hw_draw(uint32_t type, const pvtx *buf, uint32_t n);
+  * through mode, clear mode, points, lines and sprites keep the CPU path. */
+ 
+ static void fill_hw_state(psp_gpu_state *st);
++static float fog_factor(const float wp[3]);
+ static int g_gpu_tl = 1;
+ static uint64_t g_tl_draws, g_tl_refused;
+ void psp_gpu_set_gpu_transform(int on) { g_gpu_tl = on != 0; }
+@@ -1493,7 +1614,9 @@ static int tl_draw(uint32_t type, uint32_t n, uint32_t vaddr, uint32_t iaddr, ui
+     return 1;
+ }
+ 
++void (*psp_gpu_tex_hook)(const psp_gpu_state *st);   /* test hook: each textured draw */
+ void psp_gpu_prim(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iaddr) {
++    if (psp_gpu_tex_hook && (R[0x1E] & 1)) { psp_gpu_state hs; memset(&hs, 0, sizeof hs); hs.tex = 1; psp_gpu_tex_hook(&hs); }
+     const uint32_t vt = R[0x12];
+     layout L;
+     make_layout(vt, &L);
+@@ -1528,6 +1651,7 @@ void psp_gpu_prim(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iaddr)
+         read_one(vaddr + idx * (uint32_t)morph_stride, vt, &L, &rv);
+         pvtx *o = &buf[i];
+         memset(o, 0, sizeof *o);
++        o->s.fog = 1.0f;
+         material_or_vertex(&rv, &o->s);
+         if (g_through) {
+             tex_coords(&rv, &o->s);
+@@ -1538,6 +1662,7 @@ void psp_gpu_prim(uint32_t type, uint32_t count, uint32_t vaddr, uint32_t iaddr)
+             if (skin) psp_ge_skin(g_bone, rv.w, (int)VT_NWEIGHT(vt), rv.pos, rv.nrm, mp, mn);
+             else { memcpy(mp, rv.pos, sizeof mp); memcpy(mn, rv.nrm, sizeof mn); }
+             psp_ge_mul43(g_world, mp, wp);
++            if (R[0x1F] & 1) o->s.fog = fog_factor(wp);
+             if (lit || map_mode == 2) {
+                 if (R[0x51] & 1) for (int k = 0; k < 3; k++) mn[k] = -mn[k];   /* reverse normals */
+                 psp_ge_mul33(g_world, mn, wn);
+@@ -1754,6 +1879,23 @@ uint64_t psp_gpu_verify_report(FILE *out) {
+ 
+ /* ---- hardware backend: draw state and helpers ------------------------------------ */
+ 
++/* Fog (0xCD end, 0xCE slope, 0xCF colour), as the GE applies it to
++ * transformed geometry: factor = clamp((view-space z + end) * slope, 0, 1),
++ * 1 leaving the colour and 0 giving the fog colour. A slope the game leaves
++ * infinite or NaN means fog switches on at the end distance. */
++static float fog_slope(void) {
++    float s = ge_float(R[0xCE]);
++    if (s != s) s = 0.0f;
++    if (isinf(s)) s = s > 0 ? 1e30f : -1e30f;
++    return s;
++}
++static float fog_factor(const float wp[3]) {
++    float vp[3];
++    psp_ge_mul43(g_view, wp, vp);
++    float f = (vp[2] + ge_float(R[0xCD])) * fog_slope();
++    return f < 0.0f ? 0.0f : f > 1.0f ? 1.0f : f;
++}
++
+ static void fill_hw_state(psp_gpu_state *st) {
+     memset(st, 0, sizeof *st);
+     st->fb_addr = g_fb; st->fb_stride = g_fbw; st->fb_fmt = g_psm;
+@@ -1794,11 +1936,15 @@ static void fill_hw_state(psp_gpu_state *st) {
+     st->bsrc = (int)(R[0xDF] & 0xF); st->bdst = (int)((R[0xDF] >> 4) & 0xF); st->beq = (int)((R[0xDF] >> 8) & 0xF);
+     st->fixa = R[0xE0] & 0xFFFFFF; st->fixb = R[0xE1] & 0xFFFFFF;
+     st->mask_rgb = R[0xE8] & 0xFFFFFF; st->mask_a = R[0xE9] & 0xFF;
++    st->fog = !g_through && !g_clear && (R[0x1F] & 1);
++    st->through = g_through;
++
++    if (st->fog) { st->fog_col = R[0xCF] & 0xFFFFFF; st->fog_end = ge_float(R[0xCD]); st->fog_slope = fog_slope(); }
+ }
+ 
+ void psp_gpu_decode_texture(uint32_t *out) {
+     const uint32_t w = tex_w(0), h = tex_h(0);
+-    fast_setup();                                  /* cached texture pointer and palette */
++    fast_setup_mode(1);                            /* cached texture pointer and palette, not the colour buffer */
+     for (uint32_t y = 0; y < h; y++)
+         for (uint32_t x = 0; x < w; x++)
+             out[y * w + x] = F.ok && g_tex ? fast_texel(x, y) : fetch_texel(x, y);
+@@ -1816,6 +1962,104 @@ static uint64_t hash_bytes(uint64_t h, const uint8_t *p, size_t n) {
+     return h;
+ }
+ 
++/* ---- PPSSPP texture-pack keys --------------------------------------------------------------
++ * A pack's textures.ini names each texture as 16 hex digits of cache key
++ * (address << 32 | dimension ^ palette hash; the address is 0 with
++ * ignoreAddress) and 8 of data hash. This is PPSSPP's arithmetic (1.12+,
++ * TextureCacheCommon / TextureReplacer::ComputeHash), so its packs match. */
++#define XP32_1 0x9E3779B1u
++#define XP32_2 0x85EBCA77u
++#define XP32_3 0xC2B2AE3Du
++#define XP32_4 0x27D4EB2Fu
++#define XP32_5 0x165667B1u
++static inline uint32_t xrotl32(uint32_t x, int r) { return (x << r) | (x >> (32 - r)); }
++static inline uint32_t xrd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
++static inline uint64_t xrd64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }
++static uint32_t xxh32(const uint8_t *p, size_t len, uint32_t seed) {
++    const uint8_t *end = p + len;
++    uint32_t h;
++    if (len >= 16) {
++        uint32_t v1 = seed + XP32_1 + XP32_2, v2 = seed + XP32_2, v3 = seed, v4 = seed - XP32_1;
++        const uint8_t *lim = end - 16;
++        do {
++            v1 = xrotl32(v1 + xrd32(p) * XP32_2, 13) * XP32_1; p += 4;
++            v2 = xrotl32(v2 + xrd32(p) * XP32_2, 13) * XP32_1; p += 4;
++            v3 = xrotl32(v3 + xrd32(p) * XP32_2, 13) * XP32_1; p += 4;
++            v4 = xrotl32(v4 + xrd32(p) * XP32_2, 13) * XP32_1; p += 4;
++        } while (p <= lim);
++        h = xrotl32(v1, 1) + xrotl32(v2, 7) + xrotl32(v3, 12) + xrotl32(v4, 18);
++    } else h = seed + XP32_5;
++    h += (uint32_t)len;
++    while (p + 4 <= end) { h += xrd32(p) * XP32_3; h = xrotl32(h, 17) * XP32_4; p += 4; }
++    while (p < end) { h += (*p) * XP32_5; h = xrotl32(h, 11) * XP32_1; p++; }
++    h ^= h >> 15; h *= XP32_2; h ^= h >> 13; h *= XP32_3; h ^= h >> 16;
++    return h;
++}
++#define XP64_1 0x9E3779B185EBCA87ull
++#define XP64_2 0xC2B2AE3D27D4EB4Full
++#define XP64_3 0x165667B19E3779F9ull
++#define XP64_4 0x85EBCA77C2B2AE63ull
++#define XP64_5 0x27D4EB2F165667C5ull
++static inline uint64_t xrotl64(uint64_t x, int r) { return (x << r) | (x >> (64 - r)); }
++static inline uint64_t xround64(uint64_t acc, uint64_t in) { acc += in * XP64_2; acc = xrotl64(acc, 31); return acc * XP64_1; }
++static inline uint64_t xmerge64(uint64_t acc, uint64_t v) { v = xround64(0, v); acc ^= v; return acc * XP64_1 + XP64_4; }
++static uint64_t xxh64(const uint8_t *p, size_t len, uint64_t seed) {
++    const uint8_t *end = p + len;
++    uint64_t h;
++    if (len >= 32) {
++        uint64_t v1 = seed + XP64_1 + XP64_2, v2 = seed + XP64_2, v3 = seed, v4 = seed - XP64_1;
++        const uint8_t *lim = end - 32;
++        do {
++            v1 = xround64(v1, xrd64(p)); p += 8;
++            v2 = xround64(v2, xrd64(p)); p += 8;
++            v3 = xround64(v3, xrd64(p)); p += 8;
++            v4 = xround64(v4, xrd64(p)); p += 8;
++        } while (p <= lim);
++        h = xrotl64(v1, 1) + xrotl64(v2, 7) + xrotl64(v3, 12) + xrotl64(v4, 18);
++        h = xmerge64(h, v1); h = xmerge64(h, v2); h = xmerge64(h, v3); h = xmerge64(h, v4);
++    } else h = seed + XP64_5;
++    h += (uint64_t)len;
++    while (p + 8 <= end) { h ^= xround64(0, xrd64(p)); h = xrotl64(h, 27) * XP64_1 + XP64_4; p += 8; }
++    if (p + 4 <= end) { h ^= (uint64_t)xrd32(p) * XP64_1; h = xrotl64(h, 23) * XP64_2 + XP64_3; p += 4; }
++    while (p < end) { h ^= (*p) * XP64_5; h = xrotl64(h, 11) * XP64_1; p++; }
++    h ^= h >> 33; h *= XP64_2; h ^= h >> 29; h *= XP64_3; h ^= h >> 32;
++    return h;
++}
++uint32_t psp_gpu_xxh32(const void *p, size_t n, uint32_t seed) { return xxh32((const uint8_t *)p, n, seed); }
++uint64_t psp_gpu_xxh64(const void *p, size_t n, uint64_t seed) { return xxh64((const uint8_t *)p, n, seed); }
++
++int psp_gpu_pack_key(uint32_t *key_lo, uint32_t *hash, int xxh64_hash) {
++    static const int bpp_of[11] = { 16, 16, 16, 32, 4, 8, 16, 32, 4, 8, 8 };
++    const int psm = (int)(R[0xC3] & 0xF);
++    if (psm > 10) return 0;
++    const uint32_t w = 1u << (R[0xB8] & 0xF), h = 1u << ((R[0xB8] >> 8) & 0xF), bufw = R[0xA8] & 0x7FF;
++    const uint32_t addr = tex_addr(0), bpp = (uint32_t)bpp_of[psm];
++    uint32_t hv = 0;
++    if (bufw <= w) {
++        const uint32_t pixels = bufw * h + (w - bufw), bytes = bpp * pixels / 8;
++        const uint8_t *p = mem(addr, bytes);
++        if (!p) return 0;
++        hv = xxh64_hash ? (uint32_t)xxh64(p, bytes, 0xBACD7814u) : xxh32(p, bytes, 0xBACD7814u);
++    } else {
++        const uint32_t line = bpp * w / 8, stride = bpp * bufw / 8;
++        const uint8_t *p = mem(addr, stride * (h - 1) + line);
++        if (!p) return 0;
++        for (uint32_t y = 0; y < h; y++, p += stride)
++            hv = (hv * 11) ^ (xxh64_hash ? (uint32_t)xxh64(p, line, 0xBACD7814u) : xxh32(p, line, 0xBACD7814u));
++    }
++    uint32_t lo = R[0xB8] & 0xF0F;                       /* the level-0 dimension */
++    if (psm >= 4 && psm <= 7) {
++        const uint32_t cf = R[0xC5] & 0xFFFFFF;
++        const uint32_t base_bytes = (((cf >> 16) & 0x1F) << 4) * ((cf & 3) == 3 ? 4u : 2u);
++        uint32_t ext = g_clut_total + base_bytes;
++        if (ext > g_clut_max) ext = g_clut_max;
++        if (ext > sizeof g_clut) ext = sizeof g_clut;
++        lo ^= xxh32(g_clut, ext, 0xC0108888u) ^ (0xC5000000u | cf);
++    }
++    *key_lo = lo; *hash = hv;
++    return 1;
++}
++
+ uint64_t psp_gpu_texture_hash(void) {
+     static const int bpp_of[11] = { 16, 16, 16, 32, 4, 8, 16, 32, 4, 8, 8 };
+     const int psm = (int)(R[0xC3] & 0xF);
+@@ -1982,6 +2226,8 @@ void psp_gpu_cmd(uint32_t cmd, uint32_t arg) {
+         uint32_t src = (R[0xB0] & 0xFFFFF0u) | ((R[0xB1] & 0x0F0000u) << 8);
+         uint8_t *p = mem(src, n);
+         if (p && n <= sizeof g_clut) memcpy(g_clut, p, n);
++        g_clut_total = n;
++        if (n > g_clut_max) g_clut_max = n;
+         /* Hash the palette now, so the texture key can carry it (see
+          * fill_hw_state): one CLUT4/8 image drawn with different palettes is
+          * a different texture to a backend's cache. */
+diff --git a/src/hle/hle.c b/src/hle/hle.c
+index 5d9bad4..9651815 100644
+--- a/src/hle/hle.c
++++ b/src/hle/hle.c
+@@ -149,11 +149,87 @@ void psp_hle_dump_calls(FILE *out, int top) {
+                 (unsigned long long)g_calls[idx[i]]);
+ }
+ 
++/* The last firmware calls (name or NID, return address), for a host's hang
++ * report. Written on every call; read only by a watchdog after a stall. */
++volatile psp_hle_crumb psp_hle_trail[PSP_HLE_TRAIL];
++/* Where the game thread is, for a host's sampling profiler: the guest block
++ * address the generated code last marked (profiling builds only), or 1 while
++ * the scheduler idles, 2 in a firmware call, 3 waiting for the GE thread. */
++volatile uint32_t psp_prof_cur;
++volatile uint32_t psp_hle_trail_n;
++
++#include <time.h>
++static uint64_t g_ns[HLE_MAX], g_ns_last[HLE_MAX], g_ns_last2[HLE_MAX];
++static uint64_t hle_now_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
++
++/* As psp_hle_time_top with its own baseline, leaving out the calls that
++ * block (their time is other threads'), for the per-spike log. */
++void psp_hle_time_top_nonblocking(char *out, size_t cap, int top) {
++    int pick[16], np = 0;
++    if (top > 16) top = 16;
++    size_t len = 0; out[0] = 0;
++    for (int r = 0; r < top; r++) {
++        int b = -1;
++        for (int i = 0; i < g_count && i < HLE_MAX; i++) {
++            const char *n = g_entry[i].name ? g_entry[i].name : "";
++            if (strstr(n, "Wait") || strstr(n, "Delay") || strstr(n, "Blocking") || strstr(n, "Sync") || strstr(n, "Sleep")) continue;
++            int taken = 0;
++            for (int k = 0; k < np; k++) if (pick[k] == i) taken = 1;
++            if (taken) continue;
++            if (b < 0 || g_ns[i] - g_ns_last2[i] > g_ns[b] - g_ns_last2[b]) b = i;
++        }
++        if (b < 0 || g_ns[b] == g_ns_last2[b]) break;
++        pick[np++] = b;
++        len += (size_t)snprintf(out + len, len < cap ? cap - len : 0, "%s%s %.2f", r ? ", " : "",
++                                g_entry[b].name ? g_entry[b].name : "?", (double)(g_ns[b] - g_ns_last2[b]) / 1e6);
++        if (len >= cap) break;
++    }
++    for (int i = 0; i < g_count && i < HLE_MAX; i++) g_ns_last2[i] = g_ns[i];
++}
++
++/* The firmware calls that took the most host time since the last call to
++ * this, as "name ms" pairs (a blocking call's time includes the threads that
++ * ran while it waited). */
++void psp_hle_time_top(char *out, size_t cap, int top) {
++    int used[16] = { 0 }, pick[16];
++    if (top > 16) top = 16;
++    size_t len = 0;
++    out[0] = 0;
++    for (int r = 0; r < top; r++) {
++        int b = -1;
++        for (int i = 0; i < g_count && i < HLE_MAX; i++) {
++            int taken = 0;
++            for (int k = 0; k < r; k++) if (pick[k] == i) taken = 1;
++            if (taken) continue;
++            if (b < 0 || g_ns[i] - g_ns_last[i] > g_ns[b] - g_ns_last[b]) b = i;
++        }
++        if (b < 0) break;
++        pick[r] = b; used[r] = 1;
++        len += (size_t)snprintf(out + len, len < cap ? cap - len : 0, "%s%s %.2f", r ? ", " : "",
++                                g_entry[b].name ? g_entry[b].name : "?", (double)(g_ns[b] - g_ns_last[b]) / 1e6);
++        if (len >= cap) break;
++    }
++    (void)used;
++    for (int i = 0; i < g_count && i < HLE_MAX; i++) g_ns_last[i] = g_ns[i];
++}
++
+ void psp_hle_call(uint32_t nid) {
++    {
++        const uint32_t k = psp_hle_trail_n++ % PSP_HLE_TRAIL;
++        psp_hle_trail[k].nid = nid;
++        psp_hle_trail[k].ra = psp_cpu.r[31];
++        psp_hle_trail[k].name = NULL;
++    }
+     for (int i = 0; i < g_count; i++) {
+         if (g_entry[i].nid == nid) {
++            psp_hle_trail[(psp_hle_trail_n - 1) % PSP_HLE_TRAIL].name = g_entry[i].name;
+             g_calls[i]++;
++            const uint64_t t0_ = hle_now_ns();
++            const uint32_t prof_ = psp_prof_cur;
++            psp_prof_cur = 2;
+             g_fn[i]();
++            psp_prof_cur = prof_;
++            g_ns[i] += hle_now_ns() - t0_;
+             if (psp_cpu.r[PSP_REG_V0] == 0) note_zero(nid, g_entry[i].name);
+             /* Firmware calls are where a higher-priority thread made ready by
+              * this call (or by an event that fell due) takes over. */
+diff --git a/src/hle/iofilemgr.c b/src/hle/iofilemgr.c
+index a8b666f..0acce7b 100644
+--- a/src/hle/iofilemgr.c
++++ b/src/hle/iofilemgr.c
+@@ -548,6 +548,11 @@ static void hle_Close(void) {
+     psp_ret(0);
+ }
+ 
++/* The longest single host read (one piece) since the last call, for the log. */
++static uint64_t g_read_max_us;
++static uint32_t g_read_max_bytes;
++void psp_io_read_stats(uint64_t *max_us, uint32_t *bytes) { *max_us = g_read_max_us; *bytes = g_read_max_bytes; g_read_max_us = 0; g_read_max_bytes = 0; }
++
+ static int64_t do_read(io_file *h, uint32_t dst, uint32_t size) {
+     if (!h->f && !h->iso) return (int64_t)(int32_t)ERR_BADF;
+     if (h->iso && !g_iso) return (int64_t)(int32_t)ERR_BADF;
+@@ -558,22 +563,35 @@ static int64_t do_read(io_file *h, uint32_t dst, uint32_t size) {
+         if ((int64_t)size > left) size = (uint32_t)left;
+     }
+     if (!size) return 0;
+-    if (h->iso && fseek64(g_iso, h->base + h->pos, SEEK_SET) != 0) return 0;
+ 
+     /* Read through a host buffer and then place it, so a read that straddles
+      * the end of a guest region is rejected by the memory layer rather than
+-     * writing past it. */
+-    uint8_t *tmp = (uint8_t *)malloc(size);
++     * writing past it. A large read goes in pieces with the scheduler run
++     * between them: every PSP thread shares one host thread, so one 1 MB
++     * read from an SD card held the game's frame for 30-50 ms. The disc
++     * image is shared, so each piece seeks to its own position. */
++    const uint32_t piece = 128u * 1024u;
++    uint8_t *tmp = (uint8_t *)malloc(size < piece ? size : piece);
+     if (!tmp) return (int64_t)(int32_t)SCE_KERNEL_ERROR_NO_MEMORY;
+ 
+-    const uint64_t t0 = h->ms ? psp_sched_now_us() : 0;
+-    size_t got = fread(tmp, 1, size, h->iso ? g_iso : h->f);
+-    if (h->ms) { h->reads++; h->bytes += got; h->read_us += psp_sched_now_us() - t0; }
+-    if (h->iso) h->pos += (int64_t)got;
+-    if (got && psp_mem_write_block(dst, tmp, (uint32_t)got) != 0) {
+-        /* Fall back to byte-at-a-time so a partially mapped destination still
+-         * gets what fits, and the bad-access counter records the rest. */
+-        for (size_t i = 0; i < got; i++) psp_write8(dst + (uint32_t)i, tmp[i]);
++    size_t got = 0;
++    while (got < size) {
++        const uint32_t want = size - (uint32_t)got < piece ? size - (uint32_t)got : piece;
++        if (h->iso && fseek64(g_iso, h->base + h->pos, SEEK_SET) != 0) break;
++        const uint64_t t0 = psp_sched_now_us();
++        const size_t n = fread(tmp, 1, want, h->iso ? g_iso : h->f);
++        const uint64_t dt = psp_sched_now_us() - t0;
++        if (dt > g_read_max_us) { g_read_max_us = dt; g_read_max_bytes = (uint32_t)want; }
++        if (h->ms) { h->reads++; h->bytes += n; h->read_us += dt; }
++        if (h->iso) h->pos += (int64_t)n;
++        if (n && psp_mem_write_block(dst + (uint32_t)got, tmp, (uint32_t)n) != 0) {
++            /* Fall back to byte-at-a-time so a partially mapped destination still
++             * gets what fits, and the bad-access counter records the rest. */
++            for (size_t i = 0; i < n; i++) psp_write8(dst + (uint32_t)got + (uint32_t)i, tmp[i]);
++        }
++        got += n;
++        if (n < want) break;
++        if (got < size) psp_sched_yield_now();
+     }
+     free(tmp);
+     g_bytes_read += got;
+diff --git a/src/hle/mpeg.c b/src/hle/mpeg.c
+index 441f88f..ec74919 100644
+--- a/src/hle/mpeg.c
++++ b/src/hle/mpeg.c
+@@ -849,8 +849,14 @@ static void hle_AvcCsc(void) {
+     if (w > pw - x) w = pw - x;
+     if (h > ph - y) h = ph - y;
+     if (w > fw) w = fw;
++    /* The whole destination mapped at once: it is usually a framebuffer in
++     * VRAM, and each mapping there is one round trip to the renderer (wait
++     * for the GE, take the pages back from the GPU) -- per line, 272 a frame. */
++    uint8_t *base = NULL;
++    if (w > 0 && h > 0) base = (uint8_t *)psp_mem_ptr(dest, (uint32_t)(((h - 1) * fw + w) * bpp));
+     for (int row = 0; row < h; row++) {
+-        uint8_t *o = (uint8_t *)psp_mem_ptr(dest + (uint32_t)(row * fw * bpp), (uint32_t)(w * bpp));
++        uint8_t *o = base ? base + (size_t)row * fw * bpp
++                          : (uint8_t *)psp_mem_ptr(dest + (uint32_t)(row * fw * bpp), (uint32_t)(w * bpp));
+         if (!o) break;
+         if (!c->have_pic) { memset(o, 0, (size_t)w * bpp); continue; }
+         const uint32_t *s = c->pic + (size_t)(y + row) * c->pic_w + x;
+diff --git a/src/hle/net.c b/src/hle/net.c
+index 4a06d7f..ad9b63e 100644
+--- a/src/hle/net.c
++++ b/src/hle/net.c
+@@ -34,6 +34,11 @@
+ #  include <winsock2.h>
+ #  include <ws2tcpip.h>
+ #  include <iphlpapi.h>
++#elif defined(__SWITCH__)
++#  include <netinet/in.h>
++#  include <arpa/inet.h>
++#  include <netdb.h>
++#  include <sys/socket.h>
+ #else
+ #  include <ifaddrs.h>
+ #  include <net/if.h>
+@@ -139,6 +144,8 @@ static int host_info_query(psp_net_host *out) {
+             }
+         }
+         free(list);
++#elif defined(__SWITCH__)
++        /* offline only on Switch: no adapter is reported */
+ #else
+         struct ifaddrs *ifs = NULL;
+         if (getifaddrs(&ifs) == 0) {
+diff --git a/src/hle/net_sock.c b/src/hle/net_sock.c
+index 663d9ce..4aeb64c 100644
+--- a/src/hle/net_sock.c
++++ b/src/hle/net_sock.c
+@@ -48,6 +48,7 @@ typedef SOCKET hsock;
+ #else
+ #  include <errno.h>
+ #  include <fcntl.h>
++#  include <arpa/inet.h>
+ #  include <netinet/in.h>
+ #  include <netinet/tcp.h>
+ #  include <sys/select.h>
+diff --git a/src/hle/threadman.c b/src/hle/threadman.c
+index 61b35fc..ff4bfc5 100644
+--- a/src/hle/threadman.c
++++ b/src/hle/threadman.c
+@@ -58,7 +58,7 @@
+  * needs, since its GL context and event pump belong to that thread. Elsewhere
+  * (or with PSPRECOMP_THREAD_FIBERS) each fiber is a host thread and switching
+  * hands a baton from one to the next, so exactly one ever runs. */
+-#if (defined(__ANDROID__) || (defined(__APPLE__) && defined(__aarch64__))) && !defined(PSPRECOMP_THREAD_FIBERS) && !defined(PSPRECOMP_ASM_FIBERS)
++#if (defined(__ANDROID__) || defined(__SWITCH__) || (defined(__APPLE__) && defined(__aarch64__))) && !defined(PSPRECOMP_THREAD_FIBERS) && !defined(PSPRECOMP_ASM_FIBERS)
+ #  if defined(__aarch64__) || defined(__x86_64__)
+ #    define PSPRECOMP_ASM_FIBERS 1
+ #  else
+@@ -156,7 +156,12 @@ static const char *const WAIT_NAME[] = {
+  * plus one per tail call, and the generated functions can have large frames,
+  * so this is generous. Only `reserve` is address space; pages are committed
+  * on demand. */
+-#define FIBER_STACK_RESERVE (64u << 20)
++/* Switch (libnx): malloc commits the whole stack, so a smaller one per PSP thread. */
++#ifdef __SWITCH__
++#  define FIBER_STACK_RESERVE (16u << 20)
++#else
++#  define FIBER_STACK_RESERVE (64u << 20)
++#endif
+ 
+ #if defined(_WIN32)
+ typedef void *fiber_t;
+@@ -302,6 +307,7 @@ typedef struct psp_thread {
+     uint32_t wait_result;
+     int      wake_cb;      /* woken only to deliver callbacks */
+     uint32_t wakeup_count;
++    uint64_t run_us, run_us_last;   /* host time this thread ran (spike log) */
+ } psp_thread;
+ 
+ typedef struct {
+@@ -396,10 +402,31 @@ uint64_t psp_sched_idle_us(void) { return g_idle_us; }
+ #define VBLANK_US 16683u          /* 1e6 / 59.94 */
+ static uint32_t g_vblank_us = VBLANK_US;   /* psp_sched_set_vblank_rate */
+ 
++/* psp_sched_set_vblank_60: the vblank at exactly 60 Hz instead of the PSP's
++ * 59.94, to match a 60 Hz host display -- at 59.94 one display refresh in
++ * every ~1000 has no new frame (a small hitch every ~17 s, and a counter
++ * that reads 59.9). Kept in nanoseconds, so the whole microseconds the
++ * clock advances by never drift. */
++int psp_sched_vblank_rate(void);
++static int g_vblank_60;
++static uint32_t g_vblank_ns, g_vb_rem_ns;
++static uint32_t vblank_step_us(void) {
++    if (!g_vblank_60) return g_vblank_us;
++    g_vb_rem_ns += g_vblank_ns;
++    const uint32_t us = g_vb_rem_ns / 1000u;
++    g_vb_rem_ns %= 1000u;
++    return us;
++}
+ void psp_sched_set_vblank_rate(int mult) {
+     g_vblank_us = mult >= 2 && mult <= 4 ? VBLANK_US / (uint32_t)mult : VBLANK_US;
++    g_vblank_ns = 16666667u / (uint32_t)(mult >= 2 && mult <= 4 ? mult : 1);
++    if (g_vblank_60) g_vblank_us = g_vblank_ns / 1000u;
++}
++void psp_sched_set_vblank_60(int on) {
++    g_vblank_60 = on != 0;
++    psp_sched_set_vblank_rate(psp_sched_vblank_rate());
+ }
+-int psp_sched_vblank_rate(void) { return (int)(VBLANK_US / g_vblank_us); }
++int psp_sched_vblank_rate(void) { return g_vblank_60 ? (int)(16666u / g_vblank_us) : (int)(VBLANK_US / g_vblank_us); }
+ 
+ /* Variable refresh (psp_sched_hold_vblank): while held, a due vblank waits --
+  * the host's frame-rate code holds it while the game's frame runs, so a late
+@@ -625,11 +652,33 @@ static void switch_to_main(void) {
+ 
+ /* Leave the running thread, whose state the caller has already set. Returns
+  * when the scheduler next picks it. */
++/* The longest a PSP thread ran without reaching a scheduling point (a
++ * firmware call or a preemption point) -- time in which a due vblank could
++ * not be delivered. Reported by the host's spike log. */
++static uint64_t g_lp_us, g_lp_max;
++static const char *g_lp_thread = "", *g_lp_call = "";
++static void lp_note(void) {
++    const uint64_t now = psp_sched_now_us();
++    if (g_lp_us && now - g_lp_us > g_lp_max && g_current) {
++        g_lp_max = now - g_lp_us;
++        g_lp_thread = g_current->name;
++        const char *c = psp_hle_trail[(psp_hle_trail_n - 1) % PSP_HLE_TRAIL].name;
++        g_lp_call = c ? c : "?";
++    }
++    g_lp_us = now;
++}
++void psp_sched_gap_stats(uint64_t *max_us, const char **thread, const char **after_call) {
++    *max_us = g_lp_max; *thread = g_lp_thread; *after_call = g_lp_call;
++    g_lp_max = 0;
++}
++
+ static void yield_to_scheduler(void) {
+     psp_thread *t = g_current;
+     t->ctx = psp_cpu;
++    lp_note();
+     switch_to_main();
+     /* The scheduler restored psp_cpu from t->ctx before switching back. */
++    g_lp_us = psp_sched_now_us();
+ }
+ 
+ /* Block the current thread. Returns the code the wait ended with. In the
+@@ -823,7 +872,7 @@ static void process_events(uint64_t now) {
+ 
+     while (now >= g_next_vblank && !vblank_held(now)) {
+         g_vblank_count++;
+-        g_next_vblank += g_vblank_us;
++        g_next_vblank += vblank_step_us();
+         for (int i = 0; i < g_thread_hi; i++) {
+             psp_thread *t = &g_thread[i];
+             if (t->used && t->state == TH_WAITING && t->wait == W_VBLANK) wake(t, 0);
+@@ -866,9 +915,21 @@ static psp_thread *pick_ready(void) {
+     return best;
+ }
+ 
++/* The preemption points inside game code (recomp_funcs.h, PSPRECOMP_PREEMPT):
++ * each function entry and loop back-edge decrements the counter. */
++int psp_preempt_ctr = 4096;
++static int g_preempt_on = 1;
++void psp_preempt_set_enabled(int on) { g_preempt_on = on != 0; psp_preempt_ctr = on ? 4096 : 0x7FFFFFFF; }
++void psp_preempt_point(void) {
++    if (!g_preempt_on) { psp_preempt_ctr = 0x7FFFFFFF; return; }
++    psp_preempt_ctr = 4096;
++    psp_sched_after_hle();
++}
++
+ /* The preemption point. Called after every firmware call. */
+ void psp_sched_after_hle(void) {
+     if (!g_sched_on || !g_current || g_in_interrupt) return;
++    lp_note();
+     if (!interrupts_enabled()) return;
+     psp_ge_poll();                       /* callbacks the GE thread reached */
+     uint64_t now = psp_sched_now_us();
+@@ -1070,6 +1131,7 @@ static void run_thread(psp_thread *t) {
+         g_current = NULL;
+         return;
+     }
++    const uint64_t run_t0 = psp_sched_now_us();
+ #if defined(_WIN32)
+     SwitchToFiber(t->fiber);
+ #elif defined(PSPRECOMP_ASM_FIBERS)
+@@ -1079,6 +1141,7 @@ static void run_thread(psp_thread *t) {
+ #else
+     swapcontext(&g_main_ctx, t->fiber);
+ #endif
++    t->run_us += psp_sched_now_us() - run_t0;
+     g_current = NULL;
+     if (t->fiber_done) {
+         fiber_delete(t);
+@@ -1249,7 +1312,7 @@ static int sched_run(uint32_t entry, uint32_t arglen, uint32_t argp,
+             break;
+         }
+         uint64_t e = next_event();
+-        if (e > now) { uint64_t t0 = psp_sched_now_us(); host_sleep_us(e - now); g_idle_us += psp_sched_now_us() - t0; }
++        if (e > now) { uint64_t t0 = psp_sched_now_us(); const uint32_t pc_ = psp_prof_cur; psp_prof_cur = 1; host_sleep_us(e - now); psp_prof_cur = pc_; g_idle_us += psp_sched_now_us() - t0; }
+     }
+     g_sched_on = 0;
+     return rc;
+@@ -1377,6 +1440,20 @@ static void hle_TerminateDeleteThread(void) {
+     psp_ret(r);
+ }
+ 
++/* Let the scheduler run anything due (a vblank, a higher-priority thread)
++ * and come back to the current thread: for firmware work that would
++ * otherwise hold the one host thread for tens of milliseconds -- a large
++ * sceIoRead from the SD card -- split into pieces with this between them. */
++void psp_sched_yield_now(void) {
++    if (!g_sched_on || !g_current) return;
++    psp_thread *t = g_current;
++    const uint64_t now = psp_sched_now_us();
++    t->wait = W_DELAY; t->wait_id = 0; t->wait_timeout_ptr = 0;
++    t->wait_until = now; t->wait_cb = 0; t->wait_seq = ++g_wait_seq;
++    t->state = TH_WAITING; t->wait_start = now;
++    yield_to_scheduler();
++}
++
+ static void hle_DelayThread(void) {
+     if (!g_sched_on || !g_current) { psp_ret(SCE_KERNEL_ERROR_OK); return; }
+     uint32_t us = psp_arg(0);
+@@ -2180,3 +2257,32 @@ void psp_threadman_register(void) {
+ 
+     psp_hle_register(0xA089ECA4, "Kernel_Library",   "sceKernelMemset",                  hle_KernelMemset);
+ }
++
++/* The threads that ran longest since the last call, as "name ms" (spike log). */
++void psp_sched_thread_top(char *out, size_t cap, int top) {
++    size_t len = 0; out[0] = 0;
++    int pick[8], np = 0;
++    if (top > 8) top = 8;
++    for (int r = 0; r < top; r++) {
++        int b = -1;
++        for (int i = 0; i < g_thread_hi; i++) {
++            psp_thread *t = &g_thread[i];
++            if (!t->used) continue;
++            int taken = 0;
++            for (int k = 0; k < np; k++) if (pick[k] == i) taken = 1;
++            if (taken) continue;
++            if (b < 0 || t->run_us - t->run_us_last > g_thread[b].run_us - g_thread[b].run_us_last) b = i;
++        }
++        if (b < 0 || g_thread[b].run_us == g_thread[b].run_us_last) break;
++        pick[np++] = b;
++        len += (size_t)snprintf(out + len, len < cap ? cap - len : 0, "%s%s %.1f", r ? ", " : "", g_thread[b].name,
++                                (double)(g_thread[b].run_us - g_thread[b].run_us_last) / 1e3);
++        if (len >= cap) break;
++    }
++    for (int i = 0; i < g_thread_hi; i++) g_thread[i].run_us_last = g_thread[i].run_us;
++}
++
++const char *psp_thread_current_name(void) {
++    psp_thread *t = g_current;
++    return t ? t->name : "";
++}
+diff --git a/src/hle/utility.c b/src/hle/utility.c
+index a6f8a4b..32ba102 100644
+--- a/src/hle/utility.c
++++ b/src/hle/utility.c
+@@ -22,6 +22,8 @@
+ 
+ #include "psprecomp/hle.h"
+ 
++static void dump_key(uint32_t p);
++
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+diff --git a/src/mem.c b/src/mem.c
+index 3858105..0fde267 100644
+--- a/src/mem.c
++++ b/src/mem.c
+@@ -13,9 +13,15 @@ uint64_t   psp_mem_bad_access;
+ /* Watch writes to one address. "Which code writes this word" is a question
+  * that came up repeatedly and could only be answered by guessing; the write
+  * path is the one place that can answer it directly. */
++/* Inline fast paths (a port's generated code may read and write main RAM
++ * directly through these): psp_mem.ram while nothing needs to see the
++ * access -- no read watch, no write watch or trace, no module mapped outside
++ * RAM -- else NULL, and every access goes through psp_read / psp_write. */
++uint8_t *psp_fast_rd, *psp_fast_wr;
++static void fast_update(void);
+ static uint32_t g_wwatch;
+ static int g_whits;
+-void psp_mem_watch_write(uint32_t addr) { g_wwatch = addr; g_whits = 0; }
++void psp_mem_watch_write(uint32_t addr) { g_wwatch = addr; g_whits = 0; fast_update(); }
+ int psp_mem_watch_hits(void) { return g_whits; }
+ 
+ static void (*g_watch_hook)(uint32_t addr, uint32_t value);
+@@ -24,7 +30,7 @@ void psp_mem_set_watch_hook(void (*fn)(uint32_t addr, uint32_t value)) { g_watch
+ /* Write trace: every guest write while switched on (a host brackets one
+  * packet handler with it to see everything that handler stores). */
+ static void (*g_wtrace)(uint32_t addr, uint32_t width, uint32_t value);
+-void psp_mem_trace_writes(void (*fn)(uint32_t addr, uint32_t width, uint32_t value)) { g_wtrace = fn; }
++void psp_mem_trace_writes(void (*fn)(uint32_t addr, uint32_t width, uint32_t value)) { g_wtrace = fn; fast_update(); }
+ 
+ static void note_write(uint32_t addr, uint32_t width, uint32_t value) {
+     if (g_wtrace) g_wtrace(addr, width, value);
+@@ -44,9 +50,10 @@ static uint32_t g_rwatch[MAX_RWATCH];
+ static int g_rwatch_n;
+ static void (*g_rwatch_hook)(uint32_t watched, uint32_t addr);
+ void psp_mem_watch_read(uint32_t addr) {
+-    if (!addr) { g_rwatch_n = 0; return; }
++    if (!addr) { g_rwatch_n = 0; fast_update(); return; }
+     for (int i = 0; i < g_rwatch_n; i++) if (g_rwatch[i] == addr) return;
+     if (g_rwatch_n < MAX_RWATCH) g_rwatch[g_rwatch_n++] = addr;
++    fast_update();
+ }
+ void psp_mem_set_read_watch_hook(void (*fn)(uint32_t watched, uint32_t addr)) { g_rwatch_hook = fn; }
+ 
+@@ -101,6 +108,7 @@ int psp_mem_init(void) {
+         return -1;
+     }
+     psp_mem_bad_access = 0;
++    fast_update();
+     return 0;
+ }
+ 
+@@ -109,6 +117,7 @@ void psp_mem_free(void) {
+     free(psp_mem.vram);
+     free(psp_mem.scratch);
+     psp_mem.ram = psp_mem.vram = psp_mem.scratch = NULL;
++    fast_update();
+ }
+ 
+ /* The loaded module image, for a PRX linked outside the RAM window. */
+@@ -118,12 +127,18 @@ static uint32_t g_module_base, g_module_size;
+ int psp_mem_map_module(uint32_t base, uint32_t size) {
+     free(g_module);
+     g_module = (uint8_t *)calloc(1, size ? size : 1);
+-    if (!g_module) { g_module_size = 0; return -1; }
++    if (!g_module) { g_module_size = 0; fast_update(); return -1; }
+     g_module_base = base;
+     g_module_size = size;
++    fast_update();
+     return 0;
+ }
+ 
++static void fast_update(void) {
++    psp_fast_rd = (!g_rwatch_n && !g_module_size) ? psp_mem.ram : NULL;
++    psp_fast_wr = (!g_wwatch && !g_wtrace && !g_module_size) ? psp_mem.ram : NULL;
++}
++
+ static void (*g_vram_hook)(uint32_t off, uint32_t size);
+ void psp_mem_set_vram_hook(void (*fn)(uint32_t off, uint32_t size)) { g_vram_hook = fn; }
+ 
+diff --git a/src/vfpu.c b/src/vfpu.c
+index ecde5e6..9d04d10 100644
+--- a/src/vfpu.c
++++ b/src/vfpu.c
+@@ -118,14 +118,17 @@ static void build_tabs(void) {
+     g_tabs_ready = 1;
+ }
+ 
+-int psp_vfpu_regs(uint32_t vreg, int size, int out[4]) {
+-    if (!g_tabs_ready) build_tabs();
++/* Inlined into this file's own callers (every VFPU load, store, move and
++ * matrix operand); psp_vfpu_regs is the same for everyone else. */
++static inline __attribute__((always_inline)) int regs_inl(uint32_t vreg, int size, int out[4]) {
++    if (__builtin_expect(!g_tabs_ready, 0)) build_tabs();
+     const int sz = (size < 1 || size > 4) ? 4 : size;
+     const int8_t *t = g_regs_tab[sz - 1][vreg & 127];
+     const int len = g_regs_len[sz - 1][vreg & 127];
+     for (int i = 0; i < len; i++) out[i] = t[i];
+     return len;
+ }
++int psp_vfpu_regs(uint32_t vreg, int size, int out[4]) { return regs_inl(vreg, size, out); }
+ 
+ static int regs_compute(uint32_t vreg, int size, int out[4]) {
+     const int mtx       = (vreg >> 2) & 7;
+@@ -152,8 +155,8 @@ static int regs_compute(uint32_t vreg, int size, int out[4]) {
+ }
+ 
+ /* The full quad an operand starts in: what a prefix swizzle indexes. */
+-static void quad_regs(uint32_t vreg, int size, int out[4]) {
+-    if (!g_tabs_ready) build_tabs();
++static inline __attribute__((always_inline)) void quad_regs(uint32_t vreg, int size, int out[4]) {
++    if (__builtin_expect(!g_tabs_ready, 0)) build_tabs();
+     const int sz = (size < 1 || size > 4) ? 4 : size;
+     const int8_t *t = g_quad_tab[sz - 1][vreg & 127];
+     out[0] = t[0]; out[1] = t[1]; out[2] = t[2]; out[3] = t[3];
+@@ -224,7 +227,7 @@ static void write_dst(uint32_t vreg, int size, const float in[4]) {
+         return;
+     }
+     int d[4];
+-    psp_vfpu_regs(vreg, size, d);
++    regs_inl(vreg, size, d);
+     const uint32_t p = g_prefix_set[2] ? g_prefix[2] : 0;
+     for (int i = 0; i < size; i++) {
+         if ((p >> (8 + i)) & 1) continue;          /* masked */
+@@ -240,7 +243,7 @@ static void write_dst(uint32_t vreg, int size, const float in[4]) {
+ 
+ static void write_dst_bits(uint32_t vreg, int size, const uint32_t in[4]) {
+     int d[4];
+-    psp_vfpu_regs(vreg, size, d);
++    regs_inl(vreg, size, d);
+     const uint32_t p = g_prefix_set[2] ? g_prefix[2] : 0;
+     for (int i = 0; i < size; i++) {
+         if ((p >> (8 + i)) & 1) continue;
+@@ -252,19 +255,19 @@ static void write_dst_bits(uint32_t vreg, int size, const uint32_t in[4]) {
+ 
+ void psp_lv_s(uint32_t vt, uint32_t addr) {
+     int r[4];
+-    psp_vfpu_regs(vt, 1, r);
++    regs_inl(vt, 1, r);
+     psp_cpu.v[r[0]] = psp_read_f32(addr & ~3u);
+ }
+ 
+ void psp_sv_s(uint32_t vt, uint32_t addr) {
+     int r[4];
+-    psp_vfpu_regs(vt, 1, r);
++    regs_inl(vt, 1, r);
+     psp_write_f32(addr & ~3u, psp_cpu.v[r[0]]);
+ }
+ 
+ void psp_lv_q(uint32_t vt, uint32_t addr) {
+     int r[4];
+-    psp_vfpu_regs(vt, 4, r);
++    regs_inl(vt, 4, r);
+     addr &= ~15u;                       /* quad access is 16-byte aligned */
+     for (int i = 0; i < 4; i++)
+         psp_cpu.v[r[i]] = psp_read_f32(addr + (uint32_t)i * 4);
+@@ -272,7 +275,7 @@ void psp_lv_q(uint32_t vt, uint32_t addr) {
+ 
+ void psp_sv_q(uint32_t vt, uint32_t addr) {
+     int r[4];
+-    psp_vfpu_regs(vt, 4, r);
++    regs_inl(vt, 4, r);
+     addr &= ~15u;
+     for (int i = 0; i < 4; i++)
+         psp_write_f32(addr + (uint32_t)i * 4, psp_cpu.v[r[i]]);
+@@ -285,7 +288,7 @@ void psp_sv_q(uint32_t vt, uint32_t addr) {
+ void psp_mtv(uint32_t reg, uint32_t value) {
+     if (reg < 128) {
+         int r[4];
+-        psp_vfpu_regs(reg, 1, r);
++        regs_inl(reg, 1, r);
+         psp_cpu.v[r[0]] = psp_bits_to_f32(value);
+         return;
+     }
+@@ -301,7 +304,7 @@ void psp_mtv(uint32_t reg, uint32_t value) {
+ uint32_t psp_mfv(uint32_t reg) {
+     if (reg < 128) {
+         int r[4];
+-        psp_vfpu_regs(reg, 1, r);
++        regs_inl(reg, 1, r);
+         return psp_f32_to_bits(psp_cpu.v[r[0]]);
+     }
+     switch (reg - 128) {
+@@ -534,7 +537,7 @@ void psp_vcmov(uint32_t vd, uint32_t vs, int size, int tf, int imm3) {
+     float s[4], cur[4];
+     int d[4];
+     read_src(vs, size, s, 0);
+-    psp_vfpu_regs(vd, size, d);
++    regs_inl(vd, size, d);
+     for (int i = 0; i < size; i++) cur[i] = psp_cpu.v[d[i]];
+     const uint32_t cc = psp_cpu.vfpu_cc;
+     const int want = tf ? 0 : 1;
+@@ -678,7 +681,7 @@ static void matrix_cols(uint32_t vd, int size, int cols[4][4]) {
+     const uint32_t transpose = (vd >> 5) & 1;
+     for (int c = 0; c < size; c++) {
+         uint32_t vreg = (mtx << 2) | (uint32_t)c | (transpose << 5);
+-        psp_vfpu_regs(vreg, size, cols[c]);
++        regs_inl(vreg, size, cols[c]);
+     }
+ }
+ 
+@@ -791,7 +794,7 @@ void psp_vmscl(uint32_t vd, uint32_t vs, uint32_t vt, int size) {
+     float m[4][4];
+     int t[4];
+     matrix_read(vs, size, m);
+-    psp_vfpu_regs(vt, 1, t);
++    regs_inl(vt, 1, t);
+     const float k = psp_cpu.v[t[0]];
+     for (int c = 0; c < size; c++)
+         for (int r = 0; r < size; r++) m[c][r] *= k;
+@@ -816,8 +819,8 @@ static void transform(uint32_t vd, uint32_t vs, uint32_t vt, int order, int homo
+     int d[4], t[4];
+     matrix_read(vs, order, m);
+     const int vn = homogeneous ? order - 1 : order;
+-    psp_vfpu_regs(vt, vn, t);
+-    psp_vfpu_regs(vd, order, d);
++    regs_inl(vt, vn, t);
++    regs_inl(vd, order, d);
+ 
+     float in[4], out[4];
+     for (int i = 0; i < vn; i++) in[i] = psp_cpu.v[t[i]];
